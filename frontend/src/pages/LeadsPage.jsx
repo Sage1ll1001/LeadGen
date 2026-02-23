@@ -4,6 +4,8 @@ import Loader from "../components/Loader";
 import { getLeads, downloadLeadsUrl } from "../api";
 import { toast } from "../components/Toast";
 
+const STATUS_OPTIONS = ["", "New", "Contacted", "Qualified", "Rejected"];
+
 export default function LeadsPage() {
     const [leads, setLeads] = useState([]);
     const [total, setTotal] = useState(0);
@@ -11,13 +13,14 @@ export default function LeadsPage() {
     const [pages, setPages] = useState(0);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState("");
+    const [statusFilter, setStatusFilter] = useState("");
     const [sortBy, setSortBy] = useState("created_at");
     const [order, setOrder] = useState("desc");
 
     const fetchLeads = useCallback(async (p = page) => {
         setLoading(true);
         try {
-            const data = await getLeads({ page: p, limit: 10, search, sort_by: sortBy, order });
+            const data = await getLeads({ page: p, limit: 10, search, sort_by: sortBy, order, status: statusFilter });
             setLeads(data.leads);
             setTotal(data.total);
             setPages(data.pages);
@@ -27,12 +30,12 @@ export default function LeadsPage() {
         } finally {
             setLoading(false);
         }
-    }, [search, sortBy, order]);
+    }, [search, sortBy, order, statusFilter]);
 
     useEffect(() => {
         fetchLeads(1);
         setPage(1);
-    }, [search, sortBy, order]);
+    }, [search, sortBy, order, statusFilter]);
 
     const handleSort = (col, dir) => {
         setSortBy(col);
@@ -45,7 +48,7 @@ export default function LeadsPage() {
     };
 
     const handleDownload = () => {
-        window.open(downloadLeadsUrl(), "_blank");
+        window.open(downloadLeadsUrl({ search, status: statusFilter, sort_by: sortBy, order }), "_blank");
         toast("CSV download started!", "success");
     };
 
@@ -92,6 +95,16 @@ export default function LeadsPage() {
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
                 />
+                <select
+                    className="filter-select"
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value)}
+                    title="Filter by status"
+                >
+                    {STATUS_OPTIONS.map((s) => (
+                        <option key={s} value={s}>{s === "" ? "All Statuses" : s}</option>
+                    ))}
+                </select>
                 <select
                     className="filter-select"
                     value={`${sortBy}:${order}`}

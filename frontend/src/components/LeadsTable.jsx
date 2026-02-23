@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
-import { generateEmail } from "../api";
+import { useState, useEffect, useRef } from "react";
+import { generateEmail, updateLead } from "../api";
+import { toast } from "./Toast";
 
 const SORT_COLS = [
     { key: "name", label: "Name" },
@@ -9,13 +10,15 @@ const SORT_COLS = [
     { key: "created_at", label: "Date" },
 ];
 
+const STATUS_OPTIONS = ["New", "Contacted", "Qualified", "Rejected"];
+
+// ── Email Modal ────────────────────────────────────────────────────
 function EmailModal({ lead, onClose }) {
     const [loading, setLoading] = useState(true);
     const [email, setEmail] = useState(null);
     const [error, setError] = useState(null);
     const [copied, setCopied] = useState(false);
 
-    // Fetch email on mount
     useEffect(() => {
         generateEmail(lead)
             .then(setEmail)
@@ -62,7 +65,6 @@ function EmailModal({ lead, onClose }) {
                         <>
                             <div className="email-label">Subject</div>
                             <div className="email-subject">{email.subject}</div>
-
                             <div className="email-label" style={{ marginTop: "12px" }}>Email Body</div>
                             <div className="email-body-wrap">
                                 <div className="email-body">{email.body}</div>
@@ -84,8 +86,114 @@ function EmailModal({ lead, onClose }) {
     );
 }
 
-export default function LeadsTable({ leads, total, page, pages, onPageChange, onSort, sortBy, order }) {
+// ── Status Cell ───────────────────────────────────────────────────
+function StatusCell({ lead, onUpdate }) {
+    const [status, setStatus] = useState(lead.status || "New");
+    const [saving, setSaving] = useState(false);
+
+    const handleChange = async (e) => {
+        const newStatus = e.target.value;
+        setStatus(newStatus);
+        setSaving(true);
+        try {
+            await updateLead(lead.id, { status: newStatus });
+            onUpdate(lead.id, { status: newStatus });
+            toast(`Status updated to ${newStatus}`, "success");
+        } catch (err) {
+            toast("Failed to update status: " + err.message, "error");
+            setStatus(lead.status || "New"); // revert
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    return (
+        <div className="status-cell">
+            <span className={`status-badge status-${status.toLowerCase()}`}>{status}</span>
+            <select
+                className="status-select"
+                value={status}
+                onChange={handleChange}
+                disabled={saving}
+                title="Change status"
+            >
+                {STATUS_OPTIONS.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                ))}
+            </select>
+        </div>
+    );
+}
+
+// ── Notes Cell ────────────────────────────────────────────────────
+function NotesCell({ lead, onUpdate }) {
+    const [notes, setNotes] = useState(lead.notes || "");
+    const [editing, setEditing] = useState(false);
+    const [draft, setDraft] = useState(notes);
+    const [saving, setSaving] = useState(false);
+    const taRef = useRef(null);
+
+    const startEdit = () => {
+        setDraft(notes);
+        setEditing(true);
+        setTimeout(() => taRef.current?.focus(), 0);
+    };
+
+    const handleBlur = async () => {
+        setEditing(false);
+        if (draft === notes) return;
+        setSaving(true);
+        try {
+            await updateLead(lead.id, { notes: draft });
+            setNotes(draft);
+            onUpdate(lead.id, { notes: draft });
+            toast("Notes saved", "success");
+        } catch (err) {
+            toast("Failed to save notes: " + err.message, "error");
+            setDraft(notes); // revert
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    return (
+        <div className="notes-cell">
+            {editing ? (
+                <textarea
+                    ref={taRef}
+                    className="notes-textarea"
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onBlur={handleBlur}
+                    rows={3}
+                    placeholder="Add notes…"
+                />
+            ) : (
+                <div className="notes-preview" onClick={startEdit} title="Click to edit">
+                    {saving ? (
+                        <span style={{ color: "var(--text-muted)", fontSize: "0.75rem" }}>Saving…</span>
+                    ) : notes ? (
+                        <span className="notes-text">{notes}</span>
+                    ) : (
+                        <span className="notes-empty">✏️ Add note</span>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+}
+
+// ── Main Table Component ──────────────────────────────────────────
+export default function LeadsTable({ leads: initialLeads, total, page, pages, onPageChange, onSort, sortBy, order }) {
+    const [leads, setLeads] = useState(initialLeads);
     const [selectedLead, setSelectedLead] = useState(null);
+
+    // Sync with parent when initialLeads changes (e.g. pagination)
+    useEffect(() => { setLeads(initialLeads); }, [initialLeads]);
+
+    const handleLeadUpdate = (id, patch) => {
+        setLeads((prev) => prev.map((l) => l.id === id ? { ...l, ...patch } : l));
+    };
 
     const handleSort = (col) => {
         if (col === sortBy) {
@@ -125,6 +233,8 @@ export default function LeadsTable({ leads, total, page, pages, onPageChange, on
                                         {col.label} {sortIcon(col.key)}
                                     </th>
                                 ))}
+                                <th>Status</th>
+                                <th>Notes</th>
                                 <th>Email</th>
                                 <th>LinkedIn</th>
                                 <th>Actions</th>
@@ -133,7 +243,7 @@ export default function LeadsTable({ leads, total, page, pages, onPageChange, on
                         <tbody>
                             {leads.length === 0 ? (
                                 <tr>
-                                    <td colSpan={8}>
+                                    <td colSpan={10}>
                                         <div className="empty-state">
                                             <div className="empty-icon">📭</div>
                                             <p>No leads found. Run a search to populate this table.</p>
@@ -151,6 +261,12 @@ export default function LeadsTable({ leads, total, page, pages, onPageChange, on
                                             {lead.created_at
                                                 ? new Date(lead.created_at).toLocaleDateString()
                                                 : "—"}
+                                        </td>
+                                        <td>
+                                            <StatusCell lead={lead} onUpdate={handleLeadUpdate} />
+                                        </td>
+                                        <td>
+                                            <NotesCell lead={lead} onUpdate={handleLeadUpdate} />
                                         </td>
                                         <td className="td-email">{lead.email || <span style={{ color: "var(--text-muted)" }}>N/A</span>}</td>
                                         <td className="td-link">
@@ -181,19 +297,8 @@ export default function LeadsTable({ leads, total, page, pages, onPageChange, on
                             Showing {(page - 1) * 10 + 1}–{Math.min(page * 10, total)} of {total} leads
                         </div>
                         <div className="pagination-controls">
-                            <button
-                                className="page-btn"
-                                disabled={page === 1}
-                                onClick={() => onPageChange(1)}
-                                title="First"
-                            >«</button>
-                            <button
-                                className="page-btn"
-                                disabled={page === 1}
-                                onClick={() => onPageChange(page - 1)}
-                                title="Prev"
-                            >‹</button>
-
+                            <button className="page-btn" disabled={page === 1} onClick={() => onPageChange(1)} title="First">«</button>
+                            <button className="page-btn" disabled={page === 1} onClick={() => onPageChange(page - 1)} title="Prev">‹</button>
                             {pageNumbers().map((n) => (
                                 <button
                                     key={n}
@@ -203,19 +308,8 @@ export default function LeadsTable({ leads, total, page, pages, onPageChange, on
                                     {n}
                                 </button>
                             ))}
-
-                            <button
-                                className="page-btn"
-                                disabled={page === pages || pages === 0}
-                                onClick={() => onPageChange(page + 1)}
-                                title="Next"
-                            >›</button>
-                            <button
-                                className="page-btn"
-                                disabled={page === pages || pages === 0}
-                                onClick={() => onPageChange(pages)}
-                                title="Last"
-                            >»</button>
+                            <button className="page-btn" disabled={page === pages || pages === 0} onClick={() => onPageChange(page + 1)} title="Next">›</button>
+                            <button className="page-btn" disabled={page === pages || pages === 0} onClick={() => onPageChange(pages)} title="Last">»</button>
                         </div>
                     </div>
                 )}

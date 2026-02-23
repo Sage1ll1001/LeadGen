@@ -1,27 +1,45 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import SearchBar from "../components/SearchBar";
 import { searchLeads } from "../api";
 import { toast } from "../components/Toast";
 
+const STORAGE_KEY = "leadintel_recent_searches";
+const MAX_RECENT = 5;
+
+function getRecentSearches() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"); }
+    catch { return []; }
+}
+
+function saveRecentSearch(query) {
+    const prev = getRecentSearches().filter((q) => q !== query);
+    const updated = [query, ...prev].slice(0, MAX_RECENT);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+}
+
 export default function SearchPage() {
     const [loading, setLoading] = useState(false);
     const [result, setResult] = useState(null);
+    const [recents, setRecents] = useState(getRecentSearches);
     const navigate = useNavigate();
 
-    const handleSearch = async (query) => {
+    const handleSearch = useCallback(async (query) => {
+        if (!query.trim()) return;
         setLoading(true);
         setResult(null);
         try {
             const data = await searchLeads(query);
-            setResult(data);
+            setResult({ ...data, query });
+            saveRecentSearch(query);
+            setRecents(getRecentSearches());
             toast(`Found ${data.leads_scraped} leads! ${data.leads_stored} new stored.`, "success");
         } catch (e) {
             toast("Search failed: " + e.message, "error");
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
     return (
         <div className="hero">
@@ -40,6 +58,23 @@ export default function SearchPage() {
             </p>
 
             <SearchBar onSearch={handleSearch} loading={loading} />
+
+            {/* Recent Searches */}
+            {recents.length > 0 && (
+                <div className="recent-searches">
+                    <span className="recent-label">Recent:</span>
+                    {recents.map((q) => (
+                        <button
+                            key={q}
+                            className="recent-pill"
+                            onClick={() => handleSearch(q)}
+                            disabled={loading}
+                        >
+                            🕑 {q}
+                        </button>
+                    ))}
+                </div>
+            )}
 
             {result && (
                 <div className="result-banner" style={{ marginTop: "2rem", maxWidth: 680, width: "100%" }}>
@@ -71,6 +106,8 @@ export default function SearchPage() {
                     { icon: "📊", text: "Smart Dashboard" },
                     { icon: "✉️", text: "AI Outreach Emails" },
                     { icon: "⬇️", text: "CSV Export" },
+                    { icon: "🕑", text: "Search History" },
+                    { icon: "🏷️", text: "Lead Status Tracking" },
                 ].map((f) => (
                     <div key={f.text} style={{
                         display: "flex", alignItems: "center", gap: 8,

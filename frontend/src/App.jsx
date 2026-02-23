@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
 import SearchPage from "./pages/SearchPage";
 import LeadsPage from "./pages/LeadsPage";
+import HistoryPage from "./pages/HistoryPage";
 import { useToast, ToastContainer } from "./components/Toast";
 import "./index.css";
 
@@ -30,6 +31,12 @@ export default function App() {
             >
               📊 Dashboard
             </NavLink>
+            <NavLink
+              to="/history"
+              className={({ isActive }) => `nav-link${isActive ? " active" : ""}`}
+            >
+              🕑 History
+            </NavLink>
           </div>
         </nav>
 
@@ -37,6 +44,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<SearchPage />} />
           <Route path="/leads" element={<LeadsPage />} />
+          <Route path="/history" element={<HistoryPage />} />
         </Routes>
 
         <ToastContainer toasts={toasts} />

@@ -1,7 +1,9 @@
 import os
+import re
 import json
 import csv
 import io
+import time
 import requests
 from datetime import datetime
 
@@ -52,20 +54,26 @@ engine       = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base         = declarative_base()
 
+LEAD_STATUSES = {"New", "Contacted", "Qualified", "Rejected"}
+
 
 class Lead(Base):
     __tablename__ = "leads"
-    __table_args__ = (UniqueConstraint("email", name="uq_leads_email"),)
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_leads_email"),
+    )
 
-    id         = Column(Integer, primary_key=True, index=True)
-    name       = Column(String)
-    email      = Column(String, nullable=True)
-    company    = Column(String)
-    job_title  = Column(String)
-    location   = Column(String)
-    industry   = Column(String)
+    id           = Column(Integer, primary_key=True, index=True)
+    name         = Column(String)
+    email        = Column(String, nullable=True)
+    company      = Column(String)
+    job_title    = Column(String)
+    location     = Column(String)
+    industry     = Column(String)
     linkedin_url = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    status       = Column(String, default="New")
+    notes        = Column(Text, nullable=True)
+    created_at   = Column(DateTime, default=datetime.utcnow)
 
 
 class SearchHistory(Base):
@@ -106,30 +114,49 @@ class EmailRequest(BaseModel):
     location:  Optional[str] = None
     industry:  Optional[str] = None
 
+class LeadUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    notes:  Optional[str] = None
+
 # =========================
 # Helpers
 # =========================
 
+def _parse_retry_delay(error_str: str) -> float:
+    """Extract retryDelay seconds from a Gemini 429 error string."""
+    match = re.search(r"retryDelay.*?(\d+)s", error_str)
+    if match:
+        return min(float(match.group(1)), 60.0)
+    return 10.0
+
+
 def gemini_generate(prompt: str) -> str:
-    """Send a prompt to Gemini and return the text response."""
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        return response.text.strip()
-    except Exception as e:
-        print("Gemini error:", e)
-        raise HTTPException(status_code=500, detail=f"Gemini failed: {str(e)}")
+    """Send a prompt to Gemini and return the text response. Retries once on 429."""
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            err_str = str(e)
+            is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            if is_quota and attempt == 0:
+                delay = _parse_retry_delay(err_str)
+                print(f"Gemini quota hit. Retrying after {delay:.0f}s…")
+                time.sleep(delay)
+                continue
+            print("Gemini error:", e)
+            raise HTTPException(status_code=500, detail=f"Gemini failed: {err_str}")
 
 
 def build_google_query_fallback(query: str) -> str:
-    """Simple rule-based fallback: wraps each word/phrase in quotes after site:linkedin.com/in."""
-    # Common stopwords to skip
+    """Simple rule-based fallback: wraps each keyword in quotes."""
     stopwords = {"in", "at", "from", "the", "a", "an", "of", "and", "for", "with", "by"}
-    words = query.split()
+    words    = query.split()
     keywords = [w for w in words if w.lower() not in stopwords]
-    quoted = " ".join(f'"{k}"' for k in keywords)
+    quoted   = " ".join(f'"{k}"' for k in keywords)
     return f'site:linkedin.com/in {quoted}'
 
 
@@ -150,7 +177,6 @@ Query: {query}
     try:
         return gemini_generate(prompt)
     except HTTPException:
-        # Gemini failed (quota, key issue, etc.) — use rule-based fallback
         print("Gemini unavailable, using fallback query builder.")
         return build_google_query_fallback(query)
 
@@ -177,17 +203,16 @@ def fetch_leads_from_apify(search_query: str) -> list:
         leads   = []
 
         for item in organic:
-            link     = item.get("url", "")
+            link = item.get("url", "")
             if "linkedin.com/in" not in link:
                 continue
 
             info  = item.get("personalInfo", {})
             title = item.get("title", "")
 
-            # Parse name from title (usually "Name - Job Title")
-            parts  = title.split(" - ")
-            name   = parts[0].strip() if parts else title
-            job    = info.get("jobTitle") or (parts[1].strip() if len(parts) > 1 else None)
+            parts = title.split(" - ")
+            name  = parts[0].strip() if parts else title
+            job   = info.get("jobTitle") or (parts[1].strip() if len(parts) > 1 else None)
 
             leads.append({
                 "name":         name,
@@ -209,18 +234,21 @@ def fetch_leads_from_apify(search_query: str) -> list:
 
 
 def store_leads(leads: list) -> int:
-    """Insert leads, skipping duplicates. Returns count of newly inserted."""
-    db      = SessionLocal()
-    stored  = 0
+    """Insert leads, skipping duplicates by email OR linkedin_url."""
+    db     = SessionLocal()
+    stored = 0
     try:
         for lead in leads:
-            email = lead.get("email")
+            email        = lead.get("email")
+            linkedin_url = lead.get("linkedin_url")
 
-            # Skip duplicate check if no email (allow nulls through)
-            if email:
-                exists = db.query(Lead).filter(Lead.email == email).first()
-                if exists:
-                    continue
+            # Skip if email already exists
+            if email and db.query(Lead).filter(Lead.email == email).first():
+                continue
+
+            # Skip if linkedin_url already exists
+            if linkedin_url and db.query(Lead).filter(Lead.linkedin_url == linkedin_url).first():
+                continue
 
             new_lead = Lead(
                 name         = lead.get("name"),
@@ -229,7 +257,8 @@ def store_leads(leads: list) -> int:
                 job_title    = lead.get("job_title"),
                 location     = lead.get("location"),
                 industry     = lead.get("industry"),
-                linkedin_url = lead.get("linkedin_url"),
+                linkedin_url = linkedin_url,
+                status       = "New",
             )
             db.add(new_lead)
             stored += 1
@@ -268,10 +297,7 @@ def log_search(query: str, filters: str, total: int):
 
 @app.post("/search-leads")
 def search_leads(data: SearchRequest):
-    """
-    Convert natural language query → Google search → Apify scrape → DB store.
-    Returns the generated search query and number of leads found/stored.
-    """
+    """Convert natural language query → Google search → Apify scrape → DB store."""
     print("Incoming query:", data.query)
 
     google_query = build_google_query(data.query)
@@ -293,11 +319,12 @@ def search_leads(data: SearchRequest):
 def get_leads(
     page:    int = Query(1, ge=1),
     limit:   int = Query(10, ge=1, le=100),
-    search:  str = Query("", description="Filter by name/company/title"),
-    sort_by: str = Query("created_at", description="Column to sort by"),
-    order:   str = Query("desc", description="asc or desc"),
+    search:  str = Query("", description="Filter by name/company/title/location"),
+    status:  str = Query("", description="Filter by status (New/Contacted/Qualified/Rejected)"),
+    sort_by: str = Query("created_at"),
+    order:   str = Query("desc"),
 ):
-    """Return paginated, sortable list of leads from the database."""
+    """Return paginated, filterable, sortable list of leads."""
     db = SessionLocal()
     try:
         q = db.query(Lead)
@@ -311,8 +338,10 @@ def get_leads(
                 Lead.location.ilike(like)
             )
 
-        # Validate sort column
-        valid_cols = {"id", "name", "company", "job_title", "location", "created_at"}
+        if status and status in LEAD_STATUSES:
+            q = q.filter(Lead.status == status)
+
+        valid_cols = {"id", "name", "company", "job_title", "location", "created_at", "status"}
         if sort_by not in valid_cols:
             sort_by = "created_at"
 
@@ -326,7 +355,7 @@ def get_leads(
             "total": total,
             "page":  page,
             "limit": limit,
-            "pages": (total + limit - 1) // limit,
+            "pages": (total + limit - 1) // limit if total > 0 else 0,
             "leads": [
                 {
                     "id":           l.id,
@@ -337,6 +366,8 @@ def get_leads(
                     "location":     l.location,
                     "industry":     l.industry,
                     "linkedin_url": l.linkedin_url,
+                    "status":       l.status or "New",
+                    "notes":        l.notes,
                     "created_at":   l.created_at.isoformat() if l.created_at else None,
                 }
                 for l in items
@@ -346,22 +377,118 @@ def get_leads(
         db.close()
 
 
-@app.get("/download-leads")
-def download_leads():
-    """Stream all leads as a CSV file download."""
+@app.patch("/leads/{lead_id}")
+def update_lead(lead_id: int, data: LeadUpdateRequest):
+    """Update lead status and/or notes."""
     db = SessionLocal()
     try:
-        leads = db.query(Lead).order_by(Lead.created_at.desc()).all()
+        lead = db.query(Lead).filter(Lead.id == lead_id).first()
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found")
+
+        if data.status is not None:
+            if data.status not in LEAD_STATUSES:
+                raise HTTPException(status_code=400, detail=f"Invalid status. Use one of: {LEAD_STATUSES}")
+            lead.status = data.status
+
+        if data.notes is not None:
+            lead.notes = data.notes
+
+        db.commit()
+        db.refresh(lead)
+
+        return {
+            "id":     lead.id,
+            "status": lead.status,
+            "notes":  lead.notes,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Update error: {str(e)}")
+    finally:
+        db.close()
+
+
+@app.get("/search-history")
+def get_search_history(
+    page:  int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    order: str = Query("desc"),
+):
+    """Return paginated search history."""
+    db = SessionLocal()
+    try:
+        q = db.query(SearchHistory)
+        q = q.order_by(
+            SearchHistory.created_at.desc() if order == "desc"
+            else SearchHistory.created_at.asc()
+        )
+        total = q.count()
+        items = q.offset((page - 1) * limit).limit(limit).all()
+
+        return {
+            "total": total,
+            "page":  page,
+            "pages": (total + limit - 1) // limit if total > 0 else 0,
+            "history": [
+                {
+                    "id":                h.id,
+                    "user_query":        h.user_query,
+                    "filters_generated": h.filters_generated,
+                    "total_results":     h.total_results,
+                    "created_at":        h.created_at.isoformat() if h.created_at else None,
+                }
+                for h in items
+            ],
+        }
+    finally:
+        db.close()
+
+
+@app.get("/download-leads")
+def download_leads(
+    search:  str = Query("", description="Same filter as /leads"),
+    status:  str = Query("", description="Filter by status"),
+    sort_by: str = Query("created_at"),
+    order:   str = Query("desc"),
+):
+    """Stream filtered leads as a CSV file download."""
+    db = SessionLocal()
+    try:
+        q = db.query(Lead)
+
+        if search:
+            like = f"%{search}%"
+            q = q.filter(
+                Lead.name.ilike(like) |
+                Lead.company.ilike(like) |
+                Lead.job_title.ilike(like) |
+                Lead.location.ilike(like)
+            )
+
+        if status and status in LEAD_STATUSES:
+            q = q.filter(Lead.status == status)
+
+        valid_cols = {"id", "name", "company", "job_title", "location", "created_at", "status"}
+        if sort_by not in valid_cols:
+            sort_by = "created_at"
+        col = getattr(Lead, sort_by)
+        q   = q.order_by(col.desc() if order == "desc" else col.asc())
+
+        leads = q.all()
 
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow(["ID", "Name", "Email", "Company", "Job Title",
-                         "Location", "Industry", "LinkedIn URL", "Created At"])
+                         "Location", "Industry", "LinkedIn URL", "Status", "Notes", "Created At"])
 
         for l in leads:
             writer.writerow([
                 l.id, l.name, l.email, l.company, l.job_title,
                 l.location, l.industry, l.linkedin_url,
+                l.status or "New", l.notes or "",
                 l.created_at.isoformat() if l.created_at else "",
             ])
 
@@ -381,7 +508,6 @@ def generate_email(lead: EmailRequest):
     """Generate a personalized outreach email for a lead using Gemini (with template fallback)."""
 
     def template_email() -> dict:
-        """Return a professional template-based email when Gemini is unavailable."""
         role    = lead.job_title or "professional"
         company = lead.company   or "your organization"
         subject = f"Quick note for {lead.name} at {company}"
@@ -391,8 +517,7 @@ def generate_email(lead: EmailRequest):
             f"I'd love to connect and explore whether there's a mutual fit between what we offer "
             f"and the challenges you may be facing.\n\n"
             f"Would you be open to a brief 15-minute call this week?\n\n"
-            f"Looking forward to hearing from you.\n\n"
-            f"Best regards"
+            f"Looking forward to hearing from you.\n\nBest regards"
         )
         return {"subject": subject, "body": body}
 
@@ -420,11 +545,9 @@ Do NOT include any explanation outside the JSON block.
     try:
         raw = gemini_generate(prompt)
     except HTTPException:
-        # Gemini unavailable (quota / key) — use template fallback
         print("Gemini unavailable for email, using template fallback.")
         return template_email()
 
-    # Strip markdown code fences if present
     cleaned = raw
     if cleaned.startswith("```"):
         cleaned = "\n".join(cleaned.split("\n")[1:])
