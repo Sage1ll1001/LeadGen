@@ -9,31 +9,36 @@ This document describes the complete data flow, file responsibilities, and code 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    USER (Browser)                       │
-│              http://localhost:5173                      │
+│   https://frontend-py0dda1db-sage1ll1001s-projects      │
+│                    .vercel.app                          │
 └──────────────────────┬──────────────────────────────────┘
-                       │ HTTP (React + Vite)
+                       │ HTTPS (React + Vite on Vercel)
 ┌──────────────────────▼──────────────────────────────────┐
 │                  FRONTEND (React)                       │
-│  SearchPage → SearchBar → api.js → POST /search-leads   │
-│  LeadsPage  → LeadsTable → api.js → GET /leads          │
+│  SearchPage  → SearchBar → api.js → POST /search-leads  │
+│  LeadsPage   → LeadsTable → api.js → GET /leads         │
+│                       → PATCH /leads/{id}               │
 │                       → POST /generate-email            │
 │                       → GET /download-leads             │
+│  HistoryPage → api.js → GET /search-history             │
 └──────────────────────┬──────────────────────────────────┘
-                       │ HTTP/REST (FastAPI)
+                       │ HTTPS/REST (FastAPI on Render)
 ┌──────────────────────▼──────────────────────────────────┐
-│                BACKEND (FastAPI / main.py)               │
+│          BACKEND (FastAPI / main.py on Render)          │
 │                                                         │
 │  /search-leads ──► Gemini AI ──► Apify ──► PostgreSQL   │
 │  /generate-email ──► Gemini AI (or template fallback)   │
 │  /leads ──────────────────────────► PostgreSQL (read)   │
+│  /leads/{id} (PATCH) ─────────────► PostgreSQL (write)  │
+│  /search-history ─────────────────► PostgreSQL (read)   │
 │  /download-leads ──────────────────► PostgreSQL (read)  │
 └──────────────────────┬──────────────────────────────────┘
          ┌─────────────┴──────────────────┐
          │                                │
-┌────────▼────────┐             ┌─────────▼────────┐
-│  Google Gemini  │             │   PostgreSQL DB   │
-│  2.0 Flash API  │             │  (Supabase/Neon)  │
-└─────────────────┘             └──────────────────┘
+┌────────▼────────┐             ┌─────────▼───────────┐
+│  Google Gemini  │             │   PostgreSQL (Neon)  │
+│  2.0 Flash API  │             │   Free Tier          │
+└─────────────────┘             └─────────────────────┘
          +
 ┌─────────────────┐
 │  Apify Scraper  │
@@ -79,17 +84,19 @@ Uses `v1beta` API version (required for `gemini-2.0-flash`).
 
 **`Lead` model → `leads` table**
 
-| Field | Type |
-|---|---|
-| id | Integer PK |
-| name | String |
-| email | String (nullable, unique) |
-| company | String |
-| job_title | String |
-| location | String |
-| industry | String |
-| linkedin_url | String |
-| created_at | DateTime |
+| Field | Type | Notes |
+|---|---|---|
+| id | Integer PK | Auto-increment |
+| name | String | |
+| email | String | Nullable, unique when present |
+| company | String | |
+| job_title | String | |
+| location | String | |
+| industry | String | |
+| linkedin_url | String | Unique index (non-null rows only) |
+| status | String | Default `'New'` |
+| notes | Text | Nullable |
+| created_at | DateTime | Auto-set |
 
 **`SearchHistory` model → `search_history` table**
 
@@ -101,14 +108,35 @@ Uses `v1beta` API version (required for `gemini-2.0-flash`).
 | total_results | Integer |
 | created_at | DateTime |
 
-`Base.metadata.create_all(bind=engine)` runs on startup — creates tables if they don't exist (does NOT alter existing tables; use `migrate.py` for schema changes).
+`Base.metadata.create_all(bind=engine)` runs on startup — creates tables if they don't exist. Does NOT alter existing tables; use `migrate.py` for schema changes.
 
 ---
 
-#### Section 4 — Helper Functions
+#### Section 4 — CORS Middleware
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        FRONTEND_URL,           # specific Vercel URL from env
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",  # wildcard Vercel subdomains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+> `allow_origins` does NOT support wildcards like `https://*.vercel.app` — that's why `allow_origin_regex` is used instead.
+
+---
+
+#### Section 5 — Helper Functions
 
 ##### `gemini_generate(prompt: str) → str`
-Calls Gemini 2.0 Flash with a text prompt. Raises `HTTPException(500)` on any failure (quota, auth, network).
+Calls Gemini 2.0 Flash. On 429 quota error, parses `retryDelay` from the error, sleeps up to 60s, and retries once. Raises `HTTPException(500)` on second failure.
 
 ---
 
@@ -132,28 +160,13 @@ Output: site:linkedin.com/in "SDEs" "Microsoft" "Mumbai"
 ##### `build_google_query(query: str) → str`
 Tries Gemini first; catches `HTTPException` and falls back to `build_google_query_fallback`.
 
-**Gemini prompt template:**
-```
-Convert this lead search query into a Google search query to find LinkedIn profiles.
-Return ONLY the raw search query string.
-
-Examples:
-Input: CEO in Mumbai
-Output: site:linkedin.com/in "CEO" "Mumbai"
-
-Input: SDE at Google from Bangalore
-Output: site:linkedin.com/in "Software Engineer" "Google" "Bangalore"
-
-Query: {query}
-```
-
 ---
 
 ##### `fetch_leads_from_apify(search_query: str) → list`
 Calls the Apify `apify~google-search-scraper` actor in sync mode.
 
 **Request:**
-```python
+```
 POST https://api.apify.com/v2/acts/apify~google-search-scraper/run-sync-get-dataset-items?token=...
 Body: { "queries": search_query, "maxPagesPerQuery": 1 }
 ```
@@ -169,20 +182,21 @@ Body: { "queries": search_query, "maxPagesPerQuery": 1 }
 ---
 
 ##### `store_leads(leads: list) → int`
-Inserts leads into PostgreSQL. Skips duplicates by checking if an `email` already exists.
+Inserts leads into PostgreSQL. Skips duplicates by checking:
+1. If `email` already exists (and email is not null)
+2. If `linkedin_url` already exists
 
-- Leads with no email (`null`) are always inserted (PostgreSQL treats each NULL as unique)
 - Returns count of newly inserted leads
 - Rolls back transaction on any DB error
 
 ---
 
 ##### `log_search(query, filters, total)`
-Inserts a record into `search_history` table. Non-critical; failures are logged but don't break the flow.
+Inserts a record into `search_history`. Non-critical — failures are logged but don't break the flow.
 
 ---
 
-#### Section 5 — API Endpoints
+#### Section 6 — API Endpoints
 
 ##### `POST /search-leads`
 
@@ -197,7 +211,7 @@ build_google_query()  ←── Gemini (or fallback)
 fetch_leads_from_apify()  ←── Apify Google Search Scraper
     │
     ▼
-store_leads()  ←── PostgreSQL INSERT
+store_leads()  ←── PostgreSQL INSERT (skips duplicates)
     │
     ▼
 log_search()   ←── PostgreSQL INSERT (search_history)
@@ -217,38 +231,52 @@ Query params:
 | `page` | 1 | Page number (≥1) |
 | `limit` | 10 | Items per page (1–100) |
 | `search` | `""` | Filter by name/company/job_title/location (ILIKE) |
+| `status` | `""` | Filter by status (New/Contacted/Qualified/Rejected) |
 | `sort_by` | `created_at` | Column to sort by |
 | `order` | `desc` | `asc` or `desc` |
 
-**Valid sort columns:** `id, name, company, job_title, location, created_at`
-
-Response shape:
+Response:
 ```json
 {
-  "total": 58,
-  "page": 1,
-  "limit": 10,
-  "pages": 6,
-  "leads": [ { "id", "name", "email", "company", "job_title", "location", "industry", "linkedin_url", "created_at" } ]
+  "total": 58, "page": 1, "limit": 10, "pages": 6,
+  "leads": [{ "id", "name", "email", "company", "job_title", "location",
+               "industry", "linkedin_url", "status", "notes", "created_at" }]
 }
 ```
 
 ---
 
+##### `PATCH /leads/{id}`
+
+Updates status and/or notes for a lead.
+
+```json
+{ "status": "Contacted", "notes": "Replied positively." }
+```
+
+Validates status against `{ "New", "Contacted", "Qualified", "Rejected" }`.
+
+---
+
+##### `GET /search-history`
+
+Returns paginated search history entries ordered by `created_at`.
+
+---
+
 ##### `GET /download-leads`
 
-Streams the full leads table as a CSV file. Headers:
-```
-ID, Name, Email, Company, Job Title, Location, Industry, LinkedIn URL, Created At
-```
+Accepts same filter params as `GET /leads` (no pagination). Streams full filtered results as CSV.
 
-Uses `StreamingResponse` with `text/csv` MIME type and `Content-Disposition: attachment`.
+CSV headers:
+```
+ID, Name, Email, Company, Job Title, Location, Industry, LinkedIn URL, Status, Notes, Created At
+```
 
 ---
 
 ##### `POST /generate-email`
 
-Request body:
 ```json
 { "name": "...", "company": "...", "job_title": "...", "location": "...", "industry": "..." }
 ```
@@ -262,174 +290,87 @@ Request body:
 
 ---
 
-### `migrate.py` — Database Migration
-
-Run **once** to add columns that were added to the SQLAlchemy model after the table was first created.
-
-```python
-migrations = [
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS job_title VARCHAR;",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS location VARCHAR;",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS industry VARCHAR;",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS linkedin_url VARCHAR;",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS email VARCHAR;",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS company VARCHAR;",
-    "ALTER TABLE leads ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();",
-]
-```
-
-Uses `ADD COLUMN IF NOT EXISTS` — safe to re-run multiple times.
-
----
-
 ### `frontend/src/api.js` — API Layer
 
-Centralised fetch wrapper for all backend calls. All functions:
-- Accept typed parameters
-- Return parsed JSON on success
-- Throw `Error` with the raw response text on failure (for display in Toast)
-
-| Function | Method | Endpoint |
-|---|---|---|
-| `searchLeads(query)` | POST | `/search-leads` |
-| `getLeads({ page, limit, search, sort_by, order })` | GET | `/leads` |
-| `generateEmail(lead)` | POST | `/generate-email` |
-| `downloadLeadsUrl()` | — | Returns `/download-leads` URL |
+All backend calls centralised here. Base URL read from `import.meta.env.VITE_API_BASE` (falls back to `http://localhost:8000`).
 
 ---
 
 ### `frontend/src/App.jsx` — Router
 
-Sets up React Router with two routes:
+Three routes:
 
 | Path | Component |
 |---|---|
 | `/` | `SearchPage` |
 | `/leads` | `LeadsPage` |
-
-Contains the top navigation bar (`⚡ LeadIntel AI`, Search, Dashboard links).
-
----
-
-### `frontend/src/pages/SearchPage.jsx`
-
-The main search interface.
-
-**State:**
-- `loading` — shows `<Loader />` while request is in-flight
-- `result` — displays `google_query`, `leads_scraped`, `leads_stored` after success
-- `error` — shows `<Toast />` on failure
-
-**Flow:**
-1. User types query in `<SearchBar />`
-2. Calls `searchLeads(query)` from `api.js`
-3. On success: shows result card with stats
-4. On error: shows Toast with error message
+| `/history` | `HistoryPage` |
 
 ---
 
-### `frontend/src/pages/LeadsPage.jsx`
+### `frontend/vercel.json` — SPA Routing
 
-The leads dashboard/browser.
+```json
+{ "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }] }
+```
 
-**State:**
-- `leads` — array of lead objects
-- `pagination` — `{ total, page, pages, limit }`
-- `search` — live filter string
-- `sortBy`, `order` — current sort config
-- `loading`, `error`
-
-**Flow:**
-1. On mount and on any filter/page/sort change → calls `getLeads(params)`
-2. Passes `leads` and handlers to `<LeadsTable />`
-3. Shows pagination controls
+Required so direct URL access to `/leads` or `/history` doesn't return a 404 from Vercel's CDN.
 
 ---
 
-### `frontend/src/components/SearchBar.jsx`
-
-Controlled input with:
-- Submit on Enter key or button click
-- Disabled state while loading
-- Passes query string up to `onSearch` callback
-
----
-
-### `frontend/src/components/LeadsTable.jsx`
-
-The most complex component. Renders:
-
-1. **Summary bar** — Total Leads, This Page, Total Pages, Current Page
-2. **Leads table** — one row per lead with columns: Name/Title, Company, Email, Location, Date, Industry, LinkedIn
-3. **Email modal** — Clicking the email button calls `generateEmail(lead)`, then shows an overlay with the subject + body, and a Copy button
-4. **CSV download** — Links to `/download-leads` directly
-5. **Pagination** — Prev/Next buttons
-
-**Sort:** Clicking column headers toggles `asc`/`desc` and passes new sort config up.
-
----
-
-### `frontend/src/components/Loader.jsx`
-
-Simple animated spinner displayed during async operations.
-
----
-
-### `frontend/src/components/Toast.jsx`
-
-Notification banner that auto-hides after a timeout. Shows success (green) or error (red) messages.
-
----
-
-### `frontend/src/index.css`
-
-Full design system: CSS custom properties, dark-mode theme, glassmorphism card styles, button variants, table styles, modal overlay, animations, and responsive breakpoints.
-
----
-
-## 🔄 End-to-End Data Flow
+## 🔄 End-to-End Scenarios
 
 ### Scenario: User searches "CEOs in Mumbai"
 
 ```
 1. User types "CEOs in Mumbai" → clicks Search
 2. SearchPage.jsx → searchLeads("CEOs in Mumbai") [api.js]
-3. api.js → POST http://127.0.0.1:8000/search-leads { query: "CEOs in Mumbai" }
+3. api.js → POST https://leadintel-backend.onrender.com/search-leads
 4. main.py:search_leads() → build_google_query("CEOs in Mumbai")
-5.   → gemini_generate(prompt)  [Gemini API call]
-6.   ← "site:linkedin.com/in \"CEO\" \"Mumbai\""     [or fallback]
-7. main.py → fetch_leads_from_apify("site:linkedin.com/in \"CEO\" \"Mumbai\"")
-8.   → POST https://api.apify.com/v2/acts/apify~google-search-scraper/...
-9.   ← [ { name, linkedin_url, company, job_title, ... }, ... ]  (10 results)
-10. main.py → store_leads(leads)  → INSERT INTO leads ...  (8 new, 2 duplicates skipped)
-11. main.py → log_search(...)     → INSERT INTO search_history ...
+5.   → gemini_generate(prompt)        [Gemini API]
+6.   ← "site:linkedin.com/in \"CEO\" \"Mumbai\""
+7. main.py → fetch_leads_from_apify(...)
+8.   → POST https://api.apify.com/v2/.../apify~google-search-scraper/...
+9.   ← [ { name, linkedin_url, company, job_title, ... } ]  (10 results)
+10. store_leads() → INSERT INTO leads ... (8 new, 2 skipped as duplicates)
+11. log_search()  → INSERT INTO search_history ...
 12. ← { google_query, leads_scraped: 10, leads_stored: 8 }
-13. SearchPage.jsx renders result card with stats
+13. SearchPage.jsx renders result banner with stats
+14. Query saved to localStorage recent searches
 ```
 
-### Scenario: User opens Leads Dashboard
+### Scenario: User opens Dashboard
 
 ```
-1. User navigates to /leads
-2. LeadsPage.jsx mounts → getLeads({ page:1, limit:10, sort_by:"created_at", order:"desc" })
-3. api.js → GET /leads?page=1&limit=10&search=&sort_by=created_at&order=desc
-4. main.py:get_leads() → db.query(Lead).order_by(Lead.created_at.desc()).count() + .all()
-5. ← { total: 58, page: 1, pages: 6, leads: [...] }
-6. LeadsTable.jsx renders table rows
+1. User navigates to /leads (via nav link or direct URL)
+2. Vercel serves index.html (via vercel.json rewrite)
+3. React Router renders LeadsPage
+4. LeadsPage mounts → getLeads({ page:1, limit:10, sort_by:"created_at", order:"desc" })
+5. api.js → GET /leads?page=1&limit=10&...
+6. main.py → db.query(Lead).order_by().count() + .all()
+7. ← { total, page, pages, leads: [...] }
+8. LeadsTable renders rows with status badges, notes, email buttons
 ```
 
-### Scenario: User clicks ✉️ Email for a lead
+### Scenario: User clicks ✉️ Email
 
 ```
-1. User clicks email button on "K Krithivasan" row
-2. LeadsTable.jsx → generateEmail({ name, company, job_title, location, industry })
-3. api.js → POST /generate-email { name: "K Krithivasan", company: "TCS", job_title: "CEO & MD", ... }
-4. main.py:generate_email()
-   → try: gemini_generate(B2B_prompt)
-   → catch HTTPException (quota): return template_email()
-5. ← { subject: "Quick note for K Krithivasan at TCS", body: "Hi K Krithivasan, ..." }
-6. LeadsTable.jsx opens modal with subject + body
-7. User clicks Copy → clipboard.writeText(body)
+1. User clicks email button on lead row
+2. EmailModal opens, calls generateEmail({ name, company, ... })
+3. api.js → POST /generate-email
+4. main.py → gemini_generate(B2B prompt) → or template_email() fallback
+5. ← { subject: "...", body: "..." }
+6. Modal displays subject + body with Copy button
+```
+
+### Scenario: User re-runs a past search
+
+```
+1. User navigates to /history
+2. HistoryPage fetches GET /search-history
+3. User clicks "↺ Re-run" on a row
+4. Calls searchLeads(row.user_query)
+5. On success → navigate("/leads")
 ```
 
 ---
@@ -438,22 +379,23 @@ Full design system: CSS custom properties, dark-mode theme, glassmorphism card s
 
 | Decision | Rationale |
 |---|---|
-| Single `main.py` backend file | Simple MVP — easy to read, deploy, and modify |
+| Single `main.py` backend | Simple MVP — easy to read, deploy, and modify |
 | `ADD COLUMN IF NOT EXISTS` in migrate.py | Idempotent migrations — safe to re-run without errors |
 | Gemini fallback on all AI endpoints | App stays functional even when free-tier quota is exhausted |
-| `UniqueConstraint` on email (nullable) | Prevents duplicate leads when email is known; allows multiple no-email leads |
+| `allow_origin_regex` for Vercel CORS | `CORSMiddleware` doesn't support wildcard subdomains in `allow_origins` |
+| `vercel.json` SPA rewrites | React Router needs all routes served from `index.html` |
+| Dedup by email **AND** linkedin_url | Email can be null, so linkedin_url provides a second dedup guard |
 | `v1beta` Gemini API version | Required for `gemini-2.0-flash` model access |
-| Centralised `api.js` | Single source of truth for all backend URLs; easy to swap base URL for production |
-| React Router v7 with two pages | Clean separation between search UI and lead dashboard |
+| Centralised `api.js` | Single source of truth for backend URL; easy to swap for production |
 
 ---
 
 ## 🐛 Known Issues & Fixes Applied
 
-| Issue | Root Cause | Fix Applied |
+| Issue | Root Cause | Fix |
 |---|---|---|
 | `column leads.job_title does not exist` | `create_all()` doesn't ALTER existing tables | `migrate.py` with `ADD COLUMN IF NOT EXISTS` |
-| `500 Gemini failed: 429` on search | Free-tier daily quota exhausted | `build_google_query_fallback()` |
-| `500 Gemini failed: 429` on email | Free-tier daily quota exhausted | `template_email()` fallback in `generate_email()` |
+| `500 Gemini failed: 429` | Free-tier daily quota exhausted | `build_google_query_fallback()` + `template_email()` |
 | `404 models/gemini-1.5-flash-latest not found` | Deprecated model name | Updated to `gemini-2.0-flash` with `v1beta` |
-| Generic "Database error" with no details | Exception swallowed in `store_leads` | Changed to `f"Database error: {str(e)}"` |
+| CORS blocked on Vercel subdomain | `allow_origins` doesn't support `*.vercel.app` wildcard | `allow_origin_regex=r"https://.*\.vercel\.app"` |
+| Direct URL `/leads` returns Vercel 404 | Vercel CDN doesn't know about React Router routes | `frontend/vercel.json` with `rewrites` |

@@ -1,16 +1,103 @@
-# React + Vite
+# ⚡ LeadIntel AI — Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19 + Vite 7 frontend for the LeadIntel AI lead intelligence platform.
 
-Currently, two official plugins are available:
+## 🌐 Live
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+**Production:** https://frontend-py0dda1db-sage1ll1001s-projects.vercel.app
 
-## React Compiler
+---
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 🚀 Local Development
 
-## Expanding the ESLint configuration
+```bash
+npm install
+npm run dev
+# → http://localhost:5173
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Make sure the backend is running at `http://localhost:8000` (or set `VITE_API_BASE` env var).
+
+## 📦 Production Build
+
+```bash
+npm run build
+# Output → dist/
+```
+
+---
+
+## 🗂️ Source Structure
+
+```
+src/
+├── main.jsx          # React 19 entry point
+├── App.jsx           # BrowserRouter + Navbar + 3 page routes
+├── index.css         # Full design system (CSS variables, dark theme, glassmorphism)
+├── api.js            # Centralised fetch layer for all backend calls
+├── components/
+│   ├── LeadsTable.jsx    # Sortable table, StatusCell, NotesCell, EmailModal
+│   ├── SearchBar.jsx     # NL query input with hint chips
+│   ├── Loader.jsx        # Animated spinner
+│   └── Toast.jsx         # Global notification system (success/error/info)
+└── pages/
+    ├── SearchPage.jsx    # / — Hero search UI + recent searches
+    ├── LeadsPage.jsx     # /leads — Dashboard with filters, sort, pagination, CSV
+    └── HistoryPage.jsx   # /history — Search history + Re-run button
+```
+
+---
+
+## 🔧 Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `VITE_API_BASE` | Backend API URL | `http://localhost:8000` |
+
+For production, set in `.env.production`:
+```env
+VITE_API_BASE=https://leadintel-backend.onrender.com
+```
+
+---
+
+## 📋 Routes
+
+| Path | Page | Description |
+|---|---|---|
+| `/` | SearchPage | Natural language lead search |
+| `/leads` | LeadsPage | Leads dashboard with filtering & export |
+| `/history` | HistoryPage | Search history with Re-run |
+
+---
+
+## 🏗️ Key Files
+
+### `api.js`
+All backend calls go through here — single source of truth for the API base URL.
+
+| Function | Method | Endpoint |
+|---|---|---|
+| `searchLeads(query)` | POST | `/search-leads` |
+| `getLeads({ page, limit, search, status, sort_by, order })` | GET | `/leads` |
+| `updateLead(id, { status, notes })` | PATCH | `/leads/{id}` |
+| `getSearchHistory({ page, limit, order })` | GET | `/search-history` |
+| `generateEmail(lead)` | POST | `/generate-email` |
+| `downloadLeadsUrl(params)` | — | Returns CSV download URL |
+
+### `vercel.json`
+Configures SPA routing so React Router handles all paths:
+```json
+{ "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }] }
+```
+
+---
+
+## 🎨 Design System
+
+`index.css` provides the entire visual design system:
+- CSS custom properties for colours, gradients, spacing, shadows
+- Dark mode with glassmorphism cards
+- Responsive at 768px breakpoint
+- Status badges: New (blue) · Contacted (yellow) · Qualified (green) · Rejected (red)
+- Animations: `spin`, `fadeIn`, `slideUp`, `slideInRight`
