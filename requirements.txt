@@ -1,7 +1,9 @@
 fastapi
-uvicorn[standard]
+uvicorn
 sqlalchemy
 psycopg2-binary
-python-dotenv
-requests
 google-genai
+apify-client
+python-dotenv
+pydantic
+requests
